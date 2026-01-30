@@ -1,3 +1,4 @@
+-Office Printers
 FB-EMF-001,FB-EMF-001,DG          (1B3)
 FB-EMF-002,FB-EMF-002,Legal       (1B3)
 FB-EMF-003,FB-EMF-003,Sales&Mktg  (3B1)
@@ -9,6 +10,7 @@ FB-EMF-008,FB-EMF-008,Finace      (2J3)
 FB-EMF-009,FB-EMF-009,HR          (2J3)
 FB-EMF-010,FB-EMF-010,IT          (3B1)
 FB-EMF-011,FB-EMF-011,Sup Chain   (3B1)
+-Warehouse Printers
 FB-EMF-012,FB-EMF-012,BU-LTS      (3B3)
 FB-EMF-013,FB-EMF-013,PROCUR      (3B2)
 FB-EMF-014,FB-EMF-014,R&D         (3B3) 
@@ -19,6 +21,7 @@ FB-EMF-020,FB-EMF-020,LOGISTIC    (BERNIN)
 FB-EMF-021,FB-EMF-021,Accueil     (Accueil)
 FB-EMF-022,FB-EMF-022,HR          (2J3)
 FB-EMF-023,FB-EMF-023,IT SPARE    (3B0)
+-California Printers
 FB-EMF-026,FB-EMF-026,IT SPARE    (3B0)
 FB-EMF-027,FB-EMF-027,SECURITE    (BERNIN)
 FB-EMF-028,FB-EMF-028,Production  (3B3)
