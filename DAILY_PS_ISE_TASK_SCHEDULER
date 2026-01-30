@@ -1,0 +1,7 @@
+#Paste and run this in powershell ISE as an administrator, point the quotations to the printerreport.ps1 script to have it ran daily. 
+#Every time it runs it stores the historical variables in a history csv file that will be used to calculate distance and time of toner/paper.
+#This will allow the report to stay updated and provide printer statistics
+
+$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\printerreport.ps1"'
+$Trigger = New-ScheduledTaskTrigger -Daily -At 8:00AM
+Register-ScheduledTask -TaskName "PrinterReportDaily" -Action $Action -Trigger $Trigger -Description "Runs printerreport.ps1 daily at 8 AM"
