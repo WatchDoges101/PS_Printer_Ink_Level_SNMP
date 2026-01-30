@@ -6,10 +6,13 @@
     - Reads printers from printerlist.txt (CSV with headers: Value,Name,Description).
     - Uses OlePrn.OleSNMP (ISNMP) to query standard Printer‑MIB OIDs.
     - Correlates supplies by row index and colorant index (no brittle string guessing).
-    - Columns: K/C/M/Y (% remaining), Waste (% FULL), Drum (% remaining), Fuser (% remaining),
-      Maintenance (% remaining), Pages (lifetime), Pages (7d), and Status.
+    - Columns: 
+        * K/C/M/Y (% remaining) + K/C/M/Y (%/week)          # NEW (%/week)
+        * Waste (% FULL), Drum (% remaining), Fuser (% remaining), Maintenance (% remaining),
+        * Pages (lifetime), Pages (1d), Pages (7d), and Status.
     - Computes % correctly using Unit/Max/Level and handles -1/-2/-3 as non-numeric.
-    - Persists lifetime page counts to CSV to compute 7‑day deltas.
+    - Persists lifetime page counts and K/C/M/Y % to CSV to compute 1‑day, 7‑day, and %/week.   # NEW (K/C/M/Y in history)
+    - Enforces history retention: only the last 180 days are kept.
     - Produces C:\...\printerreport.html; optional debug CSV.
 
 .NOTES
@@ -25,7 +28,7 @@
 [CmdletBinding()]
 param(
     [string]$PrinterListPath = ".\printerlist.txt",                  # CSV: Value,Name,Description
-    [string]$ReportDir       = "DIRECTORY OF THE HTML REPORT",
+    [string]$ReportDir       = "C:\Users\IT\Desktop\PS_Printer_Ink_Level_SNMP-master",
     [string]$Community       = "public",
     [int]$Retries            = 2,
     [int]$TimeoutMs          = 3000,
@@ -75,6 +78,13 @@ function Format-Count {
     param([Nullable[long]]$Value)
     if ($null -eq $Value) { return "&nbsp;" }
     return ("{0:N0}" -f $Value)
+}
+
+# Display for %/week (neutral color)
+function Format-PercentPerWeek {
+    param([Nullable[int]]$Value)
+    if ($null -eq $Value) { return "&nbsp;" }
+    return "<b style='font-size:110%;color:#333;'>$Value</b>%/week"
 }
 
 # Compute % remaining (containers) or % full (receptacles) depending on Class.
@@ -213,19 +223,59 @@ $ReportHtml  = Join-Path $ReportDir "printerreport.html"
 $ReportTmp   = "$ReportHtml.tmp"
 $ReportBak   = "$ReportHtml.bak.html"
 $DebugCsv    = Join-Path $ReportDir "printerreport_debug.csv"
-$HistoryCsv  = Join-Path $ReportDir "printerreport_history.csv"   # NEW
+$HistoryCsv  = Join-Path $ReportDir "printerreport_history.csv"   # Stores page + color percent history
 
 # Backup last report if present
 if (Test-Path $ReportHtml) {
     Copy-Item -Path $ReportHtml -Destination $ReportBak -Force
 }
 
-# Ensure history file exists with header
+# Ensure history file exists with header (upgraded to include K,C,M,Y)
 if (-not (Test-Path $HistoryCsv)) {
-    "Timestamp,IP,Pages" | Out-File -FilePath $HistoryCsv -Encoding UTF8
+    "Timestamp,IP,Pages,K,C,M,Y" | Out-File -FilePath $HistoryCsv -Encoding UTF8
 }
-# Load history
-$history = Import-Csv -LiteralPath $HistoryCsv
+
+# --- History retention: keep last 180 days only ---
+$now = Get-Date
+$cutoff = $now.AddDays(-180)
+try {
+    $historyRaw = Import-Csv -LiteralPath $HistoryCsv
+} catch {
+    $historyRaw = @()
+}
+
+# Guarantee columns exist even if old file didn't have them
+$historyRaw = $historyRaw | ForEach-Object {
+    [pscustomobject]@{
+        Timestamp = $_.Timestamp
+        IP        = $_.IP
+        Pages     = $_.Pages
+        K         = $_.K
+        C         = $_.C
+        M         = $_.M
+        Y         = $_.Y
+    }
+}
+
+if ($historyRaw.Count -gt 0) {
+    $historyPruned =
+        $historyRaw |
+        Where-Object {
+            try { [datetime]::Parse($_.Timestamp) -ge $cutoff } catch { $false }
+        }
+
+    # Overwrite history with pruned entries (ensure full header)
+    if ($historyPruned -is [System.Array] -and $historyPruned.Count -eq 0) {
+        "Timestamp,IP,Pages,K,C,M,Y" | Out-File -FilePath $HistoryCsv -Encoding UTF8
+    } else {
+        $historyPruned | Select-Object Timestamp,IP,Pages,K,C,M,Y |
+            Export-Csv -LiteralPath $HistoryCsv -NoTypeInformation -Encoding UTF8
+    }
+
+    $history = $historyPruned
+} else {
+    $history = @()
+}
 
 # Read printer list
 if (-not (Test-Path $PrinterListPath)) {
@@ -283,9 +333,12 @@ $printerlist = Import-Csv -LiteralPath $PrinterListPath -Header Value,Name,Descr
     rows.forEach(function(r){ tb.appendChild(r); });
   }
   var colMap = {
-    black:{idx:3,pct:true}, cyan:{idx:4,pct:true}, magenta:{idx:5,pct:true}, yellow:{idx:6,pct:true},
-    waste:{idx:7,pct:true}, drum:{idx:8,pct:true}, fuser:{idx:9,pct:true}, maintenance:{idx:10,pct:true},
-    pages:{idx:11,pct:false}, pages7:{idx:12,pct:false}
+    black:{idx:3,pct:true}, blackw:{idx:4,pct:true},
+    cyan:{idx:5,pct:true},  cyanw:{idx:6,pct:true},
+    magenta:{idx:7,pct:true}, magentaw:{idx:8,pct:true},
+    yellow:{idx:9,pct:true}, yelloww:{idx:10,pct:true},
+    waste:{idx:11,pct:true}, drum:{idx:12,pct:true}, fuser:{idx:13,pct:true}, maintenance:{idx:14,pct:true},
+    pages:{idx:15,pct:false}, pages1:{idx:16,pct:false}, pages7:{idx:17,pct:false}
   };
   window._printerReportSort = function(){
     var sel = document.getElementById('sort-col');
@@ -300,12 +353,12 @@ $printerlist = Import-Csv -LiteralPath $PrinterListPath -Header Value,Name,Descr
     var last = {col:-1, dir:'desc'};
     for (var i=0;i<headers.length;i++){
       (function(ix){
-        var isNumeric = (ix>=3 && ix<=12);
+        var isNumeric = (ix>=3 && ix<=17);  // numeric/sortable columns range
         if(!isNumeric) return;
         headers[ix].style.cursor = 'pointer';
         headers[ix].title = 'Click to sort';
         headers[ix].addEventListener('click', function(){
-          var isPct = (ix>=3 && ix<=10);
+          var isPct = (ix>=3 && ix<=14);     // percent-style columns up to Maintenance
           var dir = (last.col===ix && last.dir==='asc') ? 'desc' : 'asc';
           sortTable('printer-table', ix, dir, isPct);
           last = {col:ix, dir:dir};
@@ -329,14 +382,19 @@ $validCount = ($printerlist.Value | Where-Object {$_ -and ($_ -notlike "-*")}).C
   <select id="sort-col" aria-label="Sort column">
     <option value="" selected disabled>Choose column…</option>
     <option value="black">Black (%)</option>
+    <option value="blackw">Black (%/week)</option>
     <option value="cyan">Cyan (%)</option>
+    <option value="cyanw">Cyan (%/week)</option>
     <option value="magenta">Magenta (%)</option>
+    <option value="magentaw">Magenta (%/week)</option>
     <option value="yellow">Yellow (%)</option>
+    <option value="yelloww">Yellow (%/week)</option>
     <option value="waste">Waste (% full)</option>
     <option value="drum">Drum (%)</option>
     <option value="fuser">Fuser (%)</option>
     <option value="maintenance">Maintenance (%)</option>
     <option value="pages">Pages (count)</option>
+    <option value="pages1">Pages (1d)</option>
     <option value="pages7">Pages (7d)</option>
   </select>
 
@@ -350,9 +408,9 @@ $validCount = ($printerlist.Value | Where-Object {$_ -and ($_ -notlike "-*")}).C
 </div>
 "@ | Add-Content $ReportTmp
 
-# Table start
+# Table start (now includes %/week right after each color)
 "<table id='printer-table' style='width:100%'>" | Add-Content $ReportTmp
-"<thead><tr><th>Description</th><th>Name</th><th>Type</th><th>Black</th><th>Cyan</th><th>Magenta</th><th>Yellow</th><th>Waste</th><th>Drum</th><th>Fuser</th><th>Maintenance</th><th>Pages</th><th>Pages (7d)</th><th>Status</th></tr></thead>" | Add-Content $ReportTmp
+"<thead><tr><th>Description</th><th>Name</th><th>Type</th><th>Black</th><th>Black (%/week)</th><th>Cyan</th><th>Cyan (%/week)</th><th>Magenta</th><th>Magenta (%/week)</th><th>Yellow</th><th>Yellow (%/week)</th><th>Waste</th><th>Drum</th><th>Fuser</th><th>Maintenance</th><th>Pages</th><th>Pages (1d)</th><th>Pages (7d)</th><th>Status</th></tr></thead>" | Add-Content $ReportTmp
 "<tbody>" | Add-Content $ReportTmp
 
 # SNMP COM
@@ -369,14 +427,15 @@ if ($WriteDebugCsv) {
 }
 
 $index = 0
-$now = Get-Date
+# $now was set earlier (also used for retention)
 $weekAgo = $now.AddDays(-7)
+$dayAgo  = $now.AddDays(-1)
 
 foreach ($p in $printerlist) {
 
     # Section headers for lines starting with '-'
     if ($p.Value -like "-*") {
-        "<tr><td colspan='14'><h3>$(HtmlEncode($p.Value.TrimStart('-')))</h3></td></tr>" | Add-Content $ReportTmp
+        "<tr><td colspan='19'><h3>$(HtmlEncode($p.Value.TrimStart('-')))</h3></td></tr>" | Add-Content $ReportTmp
         continue
     }
 
@@ -390,7 +449,8 @@ foreach ($p in $printerlist) {
 
     if (-not (Test-HostUp $ip)) {
         $href = "<a href=""http://$ip"" target=""_new"">$ip</a>"
-        "<td>$href</td><td><b>Offline</b></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>" | Add-Content $ReportTmp
+        # After Description: Name, Type(Offline), then 16 empties to fill to 19 columns
+        "<td>$href</td><td><b>Offline</b></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>" | Add-Content $ReportTmp
         "</tr>" | Add-Content $ReportTmp
         continue
     }
@@ -401,6 +461,10 @@ foreach ($p in $printerlist) {
     $Waste=$null; $Drum=$null; $Fuser=$null; $Maintenance=$null
     [Nullable[Int64]]$Pages = $null
     [Nullable[Int64]]$Pages7 = $null
+    [Nullable[Int64]]$Pages1 = $null
+
+    # Weekly usage per color (%/week)
+    [Nullable[int]]$KWeek=$null; [Nullable[int]]$CWeek=$null; [Nullable[int]]$MWeek=$null; [Nullable[int]]$YWeek=$null
 
     try {
         $snmp.Open($ip, $Community, $Retries, $TimeoutMs)
@@ -444,27 +508,86 @@ foreach ($p in $printerlist) {
         if ($fuserRow) { $Fuser = $fuserRow.Percent }   # % remaining
 
         # Maintenance kit (transfer/cleaner/fuser-related or explicit "maintenance/kit")
-        $maintTypes = @(18,19,20,22) # cleanerUnit(18), fuserCleaningPad(19), transferUnit(20), fuserOiler(22)
+        $maintTypes = @(18,19,20,22)
         $maintRow = $rows | Where-Object {
             ($_.Type -in $maintTypes) -or ($_.Desc -match '(?i)\bmaintenance\b|\bkit\b')
         } | Select-Object -First 1
-        if ($maintRow) { $Maintenance = $maintRow.Percent }  # % remaining
+        if ($maintRow) { $Maintenance = $maintRow.Percent }
 
         # Lifetime pages (MAX prtMarkerLifeCount across rows)
         $Pages = Get-PrinterPageCount -Snmp $snmp
 
-        # Compute 7-day delta (if a baseline at/before weekAgo exists)
+        # Compute 7-day and 1-day page deltas
         if ($Pages -ne $null) {
             $histRows = $history | Where-Object { $_.IP -eq $ip } |
-                        Select-Object @{n='TS';e={[datetime]::Parse($_.Timestamp)}}, @{n='Pages';e={[int64]$_.Pages}} |
+                        Select-Object @{n='TS';e={[datetime]::Parse($_.Timestamp)}},
+                                      @{n='Pages';e={ if($_.Pages -match '^\d+$'){ [int64]$_.Pages } else { $null } }},
+                                      @{n='K';e={ if($_.K -match '^\d+$'){ [int]$_.K } else { $null } }},
+                                      @{n='C';e={ if($_.C -match '^\d+$'){ [int]$_.C } else { $null } }},
+                                      @{n='M';e={ if($_.M -match '^\d+$'){ [int]$_.M } else { $null } }},
+                                      @{n='Y';e={ if($_.Y -match '^\d+$'){ [int]$_.Y } else { $null } }} |
                         Sort-Object TS
-            $baseline = $histRows | Where-Object { $_.TS -le $weekAgo } | Sort-Object TS -Descending | Select-Object -First 1
-            if ($baseline -and $Pages -ge $baseline.Pages) {
-                $Pages7 = $Pages - $baseline.Pages
+
+            # 7 days baseline (for Pages7 and %/week fallback)
+            $baseline7 = $histRows | Where-Object { $_.TS -le $weekAgo } | Sort-Object TS -Descending | Select-Object -First 1
+
+            if ($baseline7 -and $Pages -ge $baseline7.Pages) {
+                $Pages7 = $Pages - $baseline7.Pages
             } else {
-                # No baseline yet (first week) or counter reset/rollover -> show blank
                 $Pages7 = $null
             }
+
+            # 1 day baseline (Pages1)
+            $baseline1 = $histRows | Where-Object { $_.TS -le $dayAgo } | Sort-Object TS -Descending | Select-Object -First 1
+            if ($baseline1 -and $Pages -ge $baseline1.Pages) {
+                $Pages1 = $Pages - $baseline1.Pages
+            } else {
+                $Pages1 = $null
+            }
+
+            # ---- Compute %/week per color, using pages ----
+            function Get-WeeklyUsage {
+                param(
+                    [Nullable[int]]$CurrentPct,
+                    [string]$ColorKey  # 'K','C','M','Y'
+                )
+                if ($null -eq $CurrentPct) { return $null }
+                if ($null -eq $Pages7 -or $Pages7 -le 0) {
+                    # Fallback to empirical drop over week if baseline exists
+                    if ($baseline7 -and ($baseline7.$ColorKey -ne $null)) {
+                        $drop = $baseline7.$ColorKey - $CurrentPct
+                        if ($drop -lt 0) { $drop = 0 }
+                        return [int][math]::Min(100, [math]::Round($drop))
+                    }
+                    return $null
+                }
+
+                # Use the same weekly baseline if available for ΔPages/Δ%
+                if ($baseline7 -and ($baseline7.Pages -ne $null) -and ($baseline7.$ColorKey -ne $null) -and $Pages -ge $baseline7.Pages) {
+                    $deltaPages = $Pages - $baseline7.Pages
+                    $deltaPct   = $baseline7.$ColorKey - $CurrentPct  # positive means used
+                    if ($deltaPct -lt 0) { $deltaPct = 0 }
+                    if ($deltaPages -gt 0) {
+                        $pctPerPage = $deltaPct / $deltaPages
+                        $weekly = $pctPerPage * $Pages7
+                        return [int][math]::Min(100, [math]::Round($weekly))
+                    }
+                }
+
+                # If we can't compute % per page, try empirical drop (if available)
+                if ($baseline7 -and ($baseline7.$ColorKey -ne $null)) {
+                    $drop = $baseline7.$ColorKey - $CurrentPct
+                    if ($drop -lt 0) { $drop = 0 }
+                    return [int][math]::Min(100, [math]::Round($drop))
+                }
+
+                return $null
+            }
+
+            $KWeek = Get-WeeklyUsage -CurrentPct $K -ColorKey 'K'
+            $CWeek = Get-WeeklyUsage -CurrentPct $C -ColorKey 'C'
+            $MWeek = Get-WeeklyUsage -CurrentPct $M -ColorKey 'M'
+            $YWeek = Get-WeeklyUsage -CurrentPct $Y -ColorKey 'Y'
         }
 
         # Write debug rows if requested
@@ -488,31 +611,41 @@ foreach ($p in $printerlist) {
         "<td>$href</td>" | Add-Content $ReportTmp
         "<td><br/>$(HtmlEncode($printerType))<br/></td>" | Add-Content $ReportTmp
 
-        # Toner cells
-        "<td>$(Format-PercentCell $K)</td>" | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $C)</td>" | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $M)</td>" | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $Y)</td>" | Add-Content $ReportTmp
+        # Toner cells + %/week
+        "<td>$(Format-PercentCell $K)</td>"      | Add-Content $ReportTmp
+        "<td>$(Format-PercentPerWeek $KWeek)</td>" | Add-Content $ReportTmp
+        "<td>$(Format-PercentCell $C)</td>"      | Add-Content $ReportTmp
+        "<td>$(Format-PercentPerWeek $CWeek)</td>" | Add-Content $ReportTmp
+        "<td>$(Format-PercentCell $M)</td>"      | Add-Content $ReportTmp
+        "<td>$(Format-PercentPerWeek $MWeek)</td>" | Add-Content $ReportTmp
+        "<td>$(Format-PercentCell $Y)</td>"      | Add-Content $ReportTmp
+        "<td>$(Format-PercentPerWeek $YWeek)</td>" | Add-Content $ReportTmp
 
-        # Waste (% FULL), Drum/Fuser/Maintenance (% remaining), Pages (lifetime), Pages (7d)
+        # Waste/Drum/Fuser/Maintenance, Pages, Pages(1d), Pages(7d)
         "<td>$(Format-PercentCellWaste $Waste)</td>" | Add-Content $ReportTmp
         "<td>$(Format-PercentCell $Drum)</td>"       | Add-Content $ReportTmp
         "<td>$(Format-PercentCell $Fuser)</td>"      | Add-Content $ReportTmp
         "<td>$(Format-PercentCell $Maintenance)</td>"| Add-Content $ReportTmp
         "<td>$(Format-Count $Pages)</td>"            | Add-Content $ReportTmp
+        "<td>$(Format-Count $Pages1)</td>"           | Add-Content $ReportTmp
         "<td>$(Format-Count $Pages7)</td>"           | Add-Content $ReportTmp
 
         # Status
         "<td><b>$(HtmlEncode($statusText))</b></td>" | Add-Content $ReportTmp
 
-        # Append to history
+        # Append to history (ISO 8601; include K,C,M,Y)
         if ($Pages -ne $null) {
-            "$($now.ToString('o')),$ip,$Pages" | Add-Content -Path $HistoryCsv -Encoding UTF8
+            $kOut = if ($K -ne $null) { $K } else { "" }
+            $cOut = if ($C -ne $null) { $C } else { "" }
+            $mOut = if ($M -ne $null) { $M } else { "" }
+            $yOut = if ($Y -ne $null) { $Y } else { "" }
+            "$($now.ToString('o')),$ip,$Pages,$kOut,$cOut,$mOut,$yOut" | Add-Content -Path $HistoryCsv -Encoding UTF8
         }
 
     } catch {
         $href = "<a href=""http://$ip"" target=""_new"">$(HtmlEncode(($name,$ip | Where-Object {$_})[0]))</a>"
-        "<td>$href</td><td><b>No data</b></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>" | Add-Content $ReportTmp
+        # After Description: Name, Type(No data), then 16 empties to fill to 19 columns
+        "<td>$href</td><td><b>No data</b></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>" | Add-Content $ReportTmp
     } finally {
         try { $snmp.Close() } catch {}
     }
@@ -530,4 +663,3 @@ Move-Item -Path $ReportTmp -Destination $ReportHtml -Force
 if ($OpenWhenDone) { Start-Process $ReportHtml }
 Write-Host "Report written to: $ReportHtml"
 if ($WriteDebugCsv) { Write-Host "Debug rows written to: $DebugCsv" }
-``
