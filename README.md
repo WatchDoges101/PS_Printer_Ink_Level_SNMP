@@ -1,3 +1,5 @@
+Stupid easy way to track toner/paper usage among printers on the local network
+
 # PS_Printer_Ink_Level_SNMP
 Create a HTML report of printer toner level using SNMP and PowerShell
 
