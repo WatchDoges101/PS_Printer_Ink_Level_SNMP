@@ -1,0 +1,23 @@
+#Open powershell EDI as an admin, change your directory to where the printerreport.html file is held, feel free to use any port.
+#Press play on the powershell script once you are in the directory of the printer report and you have the address set correctly and you have the port allowed in the firewall.
+#Ensure you allow the port through your computers firewall or you wont be able to reach it
+#Use this powershell command to add the rule for a custom port
+#New-NetFirewallRule -DisplayName "PS WebServer 8000" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+#Follow these steps to easily host the printerreport page via powershell on any server or computer!
+
+Add-Type -AssemblyName System.Net
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add("http://YOURLOCALADDRESS:80/")
+$listener.Start()
+
+Write-Host "Serving webpage at http://YOURLOCALADDRESS:8001/"
+
+while ($listener.IsListening) {
+    $context = $listener.GetContext()
+    $response = $context.Response
+    $html = Get-Content "printerreport.html" -Raw
+    $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
+    $response.ContentLength64 = $buffer.Length
+    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+    $response.OutputStream.Close()
+}
