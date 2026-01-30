@@ -12,3 +12,9 @@ It will retrieve information using SNMP and the default printer MIB
                              value: DNS name of your printer
                              name: Name of the printer as displayed in the report
                              description: Description of the printer that will appear in the report
+
+Once the program has been filled out with the local networks printer information you can use the PS1 script included in the repo to easily host the printer report page via any computer or server.
+
+Create a task to run the printer report weekly on the hosted computer and every week you will see the delta variable of how many pages were printed.
+
+More upgrades coming soon as my organization is looking to upgrade how they track toner usage among printers and workers.
