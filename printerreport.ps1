@@ -1,23 +1,24 @@
 <#
 .SYNOPSIS
-    Build an HTML toner/consumables report for network printers via SNMP (Printer‑MIB).
+    Build an HTML toner/consumables report for network printers via SNMP (Printer-MIB).
 
 .DESCRIPTION
     - Reads printers from printerlist.txt (CSV with headers: Value,Name,Description).
-    - Uses OlePrn.OleSNMP (ISNMP) to query standard Printer‑MIB OIDs.
+    - Uses OlePrn.OleSNMP (ISNMP) to query standard Printer-MIB OIDs.
     - Correlates supplies by row index and colorant index (no brittle string guessing).
     - Columns: 
-        * K/C/M/Y (% remaining) + K/C/M/Y (%/week)          # NEW (%/week)
+        * Imaging Kit (% remaining)
+        * K/C/M/Y (% remaining) + K/C/M/Y (%/week)
         * Waste (% FULL), Drum (% remaining), Fuser (% remaining), Maintenance (% remaining),
         * Pages (lifetime), Pages (1d), Pages (7d), and Status.
     - Computes % correctly using Unit/Max/Level and handles -1/-2/-3 as non-numeric.
-    - Persists lifetime page counts and K/C/M/Y % to CSV to compute 1‑day, 7‑day, and %/week.   # NEW (K/C/M/Y in history)
+    - Persists lifetime page counts and K/C/M/Y % to CSV to compute 1-day, 7-day, and %/week.
     - Enforces history retention: only the last 180 days are kept.
     - Produces C:\...\printerreport.html; optional debug CSV.
 
 .NOTES
     Requires Windows printing components (OlePrn.OleSNMP COM).
-    OIDs per RFC 3805 Printer‑MIB (generic/standard):
+    OIDs per RFC 3805 Printer-MIB (generic/standard):
       prtMarkerSuppliesDescription (.6), SupplyUnit (.7), MaxCapacity (.8), Level (.9),
       Class (.4: 3=supplyThatIsConsumed, 4=receptacleThatIsFilled), Type (.5),
       ColorantIndex (.3), ColorantValue (.12.1.1.4)
@@ -49,7 +50,13 @@ function Test-HostUp {
 function HtmlEncode {
     param([string]$s)
     if ($null -eq $s) { return "" }
-    return ($s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' -replace '"','&quot;' -replace "'","&#39;")
+    # Standard HTML entity encoding (ASCII-safe)
+    $s = $s -replace '&', '&amp;'
+    $s = $s -replace '<', '&lt;'
+    $s = $s -replace '>', '&gt;'
+    $s = $s -replace '"', '&quot;'
+    $s = $s -replace "'", '&#39;'
+    return $s
 }
 
 function Format-PercentCell {
@@ -193,6 +200,19 @@ function Get-PrinterSupplies {
     return ,$rows
 }
 
+# Robust detection for colorless monochrome toner (Lexmark MS510/MS810)
+function Is-ColorlessTonerDesc {
+    param([string]$desc)
+    if ([string]::IsNullOrWhiteSpace($desc)) { return $false }
+    $d = $desc.ToLowerInvariant()
+    $looksLikeToner = ($d -match '\btoner\b' -or $d -match '\bcartridge\b' -or $d -match '\bctg\b')
+    $mentionsAColor = ($d -match '\bblack\b' -or $d -match '\bbk\b' -or $d -match '(^|[^a-z])k([^a-z]|$)' -or
+                       $d -match '\bcyan\b' -or $d -match '(^|[^a-z])c([^a-z]|$)' -or
+                       $d -match '\bmagenta\b' -or $d -match '(^|[^a-z])m([^a-z]|$)' -or
+                       $d -match '\byellow\b' -or $d -match '(^|[^a-z])y([^a-z]|$)')
+    return ($looksLikeToner -and -not $mentionsAColor)
+}
+
 # Lifetime page count: return MAX prtMarkerLifeCount across rows (generic approach)
 function Get-PrinterPageCount {
     param(
@@ -213,6 +233,83 @@ function Get-PrinterPageCount {
         }
     }
     return $maxPages
+}
+
+# === NEW: Cached snapshot helper from history (PS 5.1 safe) ===
+function Get-HistorySnapshot {
+    param(
+        [Parameter(Mandatory)][string]$IP,
+        [Nullable[datetime]]$AsOf = $null
+    )
+
+    if (-not $script:history) { return $null }
+
+    if (-not $AsOf) {
+        $AsOf = [datetime]::MaxValue
+    }
+
+    $rows =
+        $script:history |
+        Where-Object { $_.IP -eq $IP } |
+        Select-Object @{
+                            n='TS'; e={ try { [datetime]::Parse($_.Timestamp) } catch { $null } }
+                        }, @{
+                            n='Pages'; e={ if($_.Pages -match '^\d+$'){ [int64]$_.Pages } else { $null } }
+                        }, @{
+                            n='K'; e={ if($_.K -match '^\d+$'){ [int]$_.K } else { $null } }
+                        }, @{
+                            n='C'; e={ if($_.C -match '^\d+$'){ [int]$_.C } else { $null } }
+                        }, @{
+                            n='M'; e={ if($_.M -match '^\d+$'){ [int]$_.M } else { $null } }
+                        }, @{
+                            n='Y'; e={ if($_.Y -match '^\d+$'){ [int]$_.Y } else { $null } }
+                        } |
+        Where-Object { $_.TS -ne $null } |
+        Sort-Object TS
+
+    if (-not $rows -or $rows.Count -eq 0) { return $null }
+
+    $latest = $rows | Where-Object { $_.TS -le $AsOf } | Select-Object -Last 1
+    if (-not $latest) { return $null }
+
+    $baseline7 = $rows | Where-Object { $_.TS -le $latest.TS.AddDays(-7) } | Select-Object -Last 1
+    $baseline1 = $rows | Where-Object { $_.TS -le $latest.TS.AddDays(-1) } | Select-Object -Last 1
+
+    [Nullable[Int64]]$Pages7 = $null
+    [Nullable[Int64]]$Pages1 = $null
+    if ($baseline7 -and $latest.Pages -ne $null -and $baseline7.Pages -ne $null -and $latest.Pages -ge $baseline7.Pages) {
+        $Pages7 = $latest.Pages - $baseline7.Pages
+    }
+    if ($baseline1 -and $latest.Pages -ne $null -and $baseline1.Pages -ne $null -and $latest.Pages -ge $baseline1.Pages) {
+        $Pages1 = $latest.Pages - $baseline1.Pages
+    }
+
+    function _weekly([Nullable[int]]$latestPct, [Nullable[int]]$baselinePct) {
+        if ($latestPct -eq $null -or $baselinePct -eq $null) { return $null }
+        $drop = $baselinePct - $latestPct
+        if ($drop -lt 0) { $drop = 0 }
+        return [int][math]::Min(100, [math]::Round($drop))
+    }
+
+    $KWeek = if ($baseline7) { _weekly $latest.K $baseline7.K } else { $null }
+    $CWeek = if ($baseline7) { _weekly $latest.C $baseline7.C } else { $null }
+    $MWeek = if ($baseline7) { _weekly $latest.M $baseline7.M } else { $null }
+    $YWeek = if ($baseline7) { _weekly $latest.Y $baseline7.Y } else { $null }
+
+    return [pscustomobject]@{
+        TS      = $latest.TS
+        Pages   = $latest.Pages
+        Pages1  = $Pages1
+        Pages7  = $Pages7
+        K       = $latest.K
+        C       = $latest.C
+        M       = $latest.M
+        Y       = $latest.Y
+        KWeek   = $KWeek
+        CWeek   = $CWeek
+        MWeek   = $MWeek
+        YWeek   = $YWeek
+    }
 }
 
 # -------------------------
@@ -276,6 +373,8 @@ if ($historyRaw.Count -gt 0) {
 } else {
     $history = @()
 }
+# Make available to helper via script: scope
+$script:history = $history
 
 # Read printer list
 if (-not (Test-Path $PrinterListPath)) {
@@ -283,7 +382,13 @@ if (-not (Test-Path $PrinterListPath)) {
 }
 $printerlist = Import-Csv -LiteralPath $PrinterListPath -Header Value,Name,Description
 
-# Start HTML (with sorting UI + JS)
+# Buffer to collect cards markup (so we can write it after the table)
+$CardBuffer = New-Object System.Text.StringBuilder
+$cardsGridOpen = $false
+
+# =========================
+# Start HTML (with sorting UI + JS + View toggle)
+# =========================
 @"
 <html>
 <head>
@@ -291,6 +396,7 @@ $printerlist = Import-Csv -LiteralPath $PrinterListPath -Header Value,Name,Descr
 <meta charset="utf-8"/>
 <style>
   * { font-family:'Trebuchet MS', Arial, sans-serif; }
+  body { margin: 16px; }
   table,th,td { border:1px solid #000; border-collapse:collapse; }
   th,td { padding:6px; vertical-align:top; }
   th { background:#f3f3f3; }
@@ -302,116 +408,379 @@ $printerlist = Import-Csv -LiteralPath $PrinterListPath -Header Value,Name,Descr
       padding:6px 8px; font-size:14px; border:1px solid #bbb; border-radius:4px; background:#fff;
   }
   .toolbar button { cursor:pointer; }
-</style>
+  .view-switch .btn { padding:6px 10px; border-radius:6px; border:1px solid #bbb; background:#f9f9f9; }
+  .view-switch .btn.active { background:#2b3152; color:#fff; border-color:#2b3152; }
 
+  /* Section headers (full row) - table */
+  #printer-table td[colspan="20"] {
+    background: #2b3152 !important;
+    color: #ffffff !important;
+  }
+  #printer-table td[colspan="20"] h3,
+  #printer-table td[colspan="20"] a { color: #ffffff !important; }
+  #printer-table td[colspan="20"] h3 { margin: 6px 0; }
+
+  /* Column order (1-based):
+     1 Description, 2 Name, 3 Type, 4 Imaging Kit,
+     5 Black, 6 Black %/week, 7 Cyan, 8 Cyan %/week,
+     9 Magenta, 10 Magenta %/week, 11 Yellow, 12 Yellow %/week,
+     13 Waste, 14 Drum, 15 Fuser, 16 Maintenance,
+     17 Pages, 18 Pages (1d), 19 Pages (7d), 20 Status
+  */
+
+  /* Primary toner % tints (table td only) */
+  #printer-table tbody td:nth-child(5)  { background-color: rgba(0, 0, 0, 0.05); }
+  #printer-table tbody td:nth-child(7)  { background-color: rgba(0, 174, 239, 0.10); }
+  #printer-table tbody td:nth-child(9)  { background-color: rgba(236, 0, 140, 0.10); }
+  #printer-table tbody td:nth-child(11) { background-color: rgba(255, 242, 0, 0.20); }
+
+  /* %/week tints (softer) */
+  #printer-table tbody td:nth-child(6)  { background-color: rgba(0, 0, 0, 0.03); }
+  #printer-table tbody td:nth-child(8)  { background-color: rgba(0, 174, 239, 0.06); }
+  #printer-table tbody td:nth-child(10) { background-color: rgba(236, 0, 140, 0.06); }
+  #printer-table tbody td:nth-child(12) { background-color: rgba(255, 242, 0, 0.10); }
+
+  /* Supplies tints */
+  #printer-table tbody td:nth-child(13) { background-color: rgba(153, 102, 51, 0.12); }
+  #printer-table tbody td:nth-child(14) { background-color: rgba(70, 130, 180, 0.12); }
+  #printer-table tbody td:nth-child(15) { background-color: rgba(255, 99, 71, 0.12); }
+  #printer-table tbody td:nth-child(16) { background-color: rgba(255, 165, 0, 0.12); }
+
+  /* Preserve text coloring set by Format-* helpers */
+  #printer-table tbody td:nth-child(5),
+  #printer-table tbody td:nth-child(6),
+  #printer-table tbody td:nth-child(7),
+  #printer-table tbody td:nth-child(8),
+  #printer-table tbody td:nth-child(9),
+  #printer-table tbody td:nth-child(10),
+  #printer-table tbody td:nth-child(11),
+  #printer-table tbody td:nth-child(12),
+  #printer-table tbody td:nth-child(13),
+  #printer-table tbody td:nth-child(14),
+  #printer-table tbody td:nth-child(15),
+  #printer-table tbody td:nth-child(16) { color: inherit; }
+
+/* Cards view (horizontal scrolling per section) */
+.hidden { display:none; }
+#cards-view { margin-top: 10px; }
+.section-divider {
+  background:#2b3152; color:#fff; padding:6px 10px; border-radius:8px; margin:18px 0 10px 0;
+}
+
+.cards-grid {
+  display: flex;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  gap: 12px;
+  padding-bottom: 8px;
+}
+
+/* Make each card a column flexbox so we can control vertical layout uniformly */
+.card {
+  background:#fff; border:1px solid #ddd; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.06);
+  overflow:hidden;
+  min-width: 320px;
+  min-height: 360px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.card-head {
+  padding:10px 12px; border-bottom:1px solid #eee;
+}
+.card-name { font-size:16px; font-weight:700; color:#2b3152; }
+.card-desc { font-size:13px; color:#333; margin-top:2px; }
+.card-type { font-size:12px; color:#666; margin-top:4px; }
+
+/* Let card-body fill the remaining space */
+.card-body {
+  padding:10px 12px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Keep these sections at natural height */
+.metrics {
+  display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:8px;
+  flex: 0 0 auto;
+}
+.metric { font-size:13px; height:15px; background:#fafafa; border:1px solid #eee; border-radius:8px; padding:6px 8px; }
+.metric.k    { background-color: rgba(0, 0, 0, 0.05); }
+.metric.kw   { background-color: rgba(0, 0, 0, 0.03); }
+.metric.c    { background-color: rgba(0, 174, 239, 0.10); }
+.metric.cw   { background-color: rgba(0, 174, 239, 0.06); }
+.metric.m    { background-color: rgba(236, 0, 140, 0.10); }
+.metric.mw   { background-color: rgba(236, 0, 140, 0.06); }
+.metric.y    { background-color: rgba(255, 242, 0, 0.20); }
+.metric.yw   { background-color: rgba(255, 242, 0, 0.10); }
+.metric.waste{ background-color: rgba(153, 102, 51, 0.12); }
+.metric.drum { background-color: rgba(70, 130, 180, 0.12); }
+.metric.fuser{ background-color: rgba(255, 99, 71, 0.12); }
+.metric.maint{ background-color: rgba(255, 165, 0, 0.12); }
+
+/* Keep pages short and on one line of “pills” */
+.row.pages {
+  display:flex; gap:8px; flex-wrap:wrap;
+  flex: 0 0 auto;
+}
+.pill {
+  background:#f3f3f3; border:1px solid #e2e2e2; border-radius:999px; padding:3px 8px; font-size:12px;
+}
+
+/* Status: scroll inside, hide overflow, and keep cards consistent */
+.row.status {
+  flex: 1 1 auto;
+  height: 100px;
+  overflow: overlay;
+  background:#f9fafb;
+  border:1px solid #eee;
+  border-radius:8px;
+  width:300px;
+  word-break: break-word;
+}
+</style>
 <script>
 (function(){
   function numFromCell(cell, isPercent){
-    if(!cell) return Number.POSITIVE_INFINITY;
-    var t = (cell.textContent || cell.innerText || "").replace(/\u00A0/g, ' ').trim();
+    if (!cell) return Number.POSITIVE_INFINITY;
+    var t = (cell.textContent || cell.innerText || "").replace(/\u00A0/g, " ").trim();
     var m = t.match(/-?\d+(?:[.,]\d+)?/);
-    if(!m) return Number.POSITIVE_INFINITY;
-    var n = parseFloat(m[0].replace(',', '.'));
+    if (!m) return Number.POSITIVE_INFINITY;
+    var n = parseFloat(m[0].replace(",", "."));
     return isNaN(n) ? Number.POSITIVE_INFINITY : n;
   }
-  function getSortableRows(tbl){
-    var expected = tbl.tHead ? tbl.tHead.rows[0].cells.length : 0;
-    var rows = Array.prototype.slice.call(tbl.tBodies[0].rows);
-    return rows.filter(function(r){ return r.cells && r.cells.length === expected; });
+
+  function getExpectedColumns(tbl){
+    return (tbl && tbl.tHead && tbl.tHead.rows[0]) ? tbl.tHead.rows[0].cells.length : 0;
   }
-  function sortTable(tableId, colIndex, direction, isPercent){
+
+  function isSectionHeaderRow(row, expectedCols){
+    if (!row || !row.cells) return false;
+    if (row.cells.length === 1) {
+      var c = row.cells[0];
+      if ((c.colSpan && c.colSpan >= expectedCols) ||
+          (typeof c.hasAttribute === "function" && c.hasAttribute("colspan"))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function sortTableGrouped(tableId, colIndex, direction, isPercent){
     var tbl = document.getElementById(tableId);
-    if(!tbl || !tbl.tBodies.length) return;
-    var rows = getSortableRows(tbl);
-    var asc = (direction === 'asc');
-    rows.sort(function(a,b){
-      var av = numFromCell(a.cells[colIndex], isPercent);
-      var bv = numFromCell(b.cells[colIndex], isPercent);
-      return asc ? (av - bv) : (bv - av);
-    });
-    var tb = tbl.tBodies[0];
-    rows.forEach(function(r){ tb.appendChild(r); });
+    if (!tbl || !tbl.tBodies || !tbl.tBodies.length) return;
+
+    var expected = getExpectedColumns(tbl);
+    if (!expected) return;
+
+    var body = tbl.tBodies[0];
+    var allRows = Array.prototype.slice.call(body.rows);
+
+    var groups = [];
+    var current = { header: null, rows: [] };
+    for (var i = 0; i < allRows.length; i++){
+      var r = allRows[i];
+      if (isSectionHeaderRow(r, expected)) {
+        groups.push(current);
+        current = { header: r, rows: [] };
+      } else {
+        current.rows.push(r);
+      }
+    }
+    groups.push(current);
+
+    var asc = (direction === "asc");
+
+    for (var g = 0; g < groups.length; g++){
+      var rows = groups[g].rows;
+      if (rows && rows.length > 1){
+        var sortable = [];
+        var nonsortable = [];
+        for (var k = 0; k < rows.length; k++){
+          if (rows[k].cells && rows[k].cells.length === expected) {
+            sortable.push(rows[k]);
+          } else {
+            nonsortable.push(rows[k]);
+          }
+        }
+        sortable.sort(function(a,b){
+          var av = numFromCell(a.cells[colIndex], isPercent);
+          var bv = numFromCell(b.cells[colIndex], isPercent);
+          return asc ? (av - bv) : (bv - av);
+        });
+        groups[g].rows = sortable.concat(nonsortable);
+      }
+    }
+
+    var frag = document.createDocumentFragment();
+    for (var j = 0; j < groups.length; j++){
+      var grp = groups[j];
+      if (grp.header) frag.appendChild(grp.header);
+      for (var y = 0; y < grp.rows.length; y++){
+        frag.appendChild(grp.rows[y]);
+      }
+    }
+    body.innerHTML = "";
+    body.appendChild(frag);
   }
+
   var colMap = {
-    black:{idx:3,pct:true}, blackw:{idx:4,pct:true},
-    cyan:{idx:5,pct:true},  cyanw:{idx:6,pct:true},
-    magenta:{idx:7,pct:true}, magentaw:{idx:8,pct:true},
-    yellow:{idx:9,pct:true}, yelloww:{idx:10,pct:true},
-    waste:{idx:11,pct:true}, drum:{idx:12,pct:true}, fuser:{idx:13,pct:true}, maintenance:{idx:14,pct:true},
-    pages:{idx:15,pct:false}, pages1:{idx:16,pct:false}, pages7:{idx:17,pct:false}
+    imaging:{idx:3,pct:true},
+    black:{idx:4,pct:true},  blackw:{idx:5,pct:true},
+    cyan:{idx:6,pct:true},   cyanw:{idx:7,pct:true},
+    magenta:{idx:8,pct:true},magentaw:{idx:9,pct:true},
+    yellow:{idx:10,pct:true},yelloww:{idx:11,pct:true},
+    waste:{idx:12,pct:true}, drum:{idx:13,pct:true}, fuser:{idx:14,pct:true}, maintenance:{idx:15,pct:true},
+    pages:{idx:16,pct:false}, pages1:{idx:17,pct:false}, pages7:{idx:18,pct:false}
   };
+
   window._printerReportSort = function(){
-    var sel = document.getElementById('sort-col');
-    var dir = document.getElementById('sort-dir').value;
-    if(!sel || !sel.value){ alert('Pick a column to sort.'); return; }
+    var sel = document.getElementById("sort-col");
+    var dir = document.getElementById("sort-dir").value;
+    if(!sel || !sel.value){ alert("Pick a column to sort."); return; }
     var meta = colMap[sel.value]; if(!meta) return;
-    sortTable('printer-table', meta.idx, dir, meta.pct);
+    sortTableGrouped("printer-table", meta.idx, dir, meta.pct);
   };
-  window.addEventListener('DOMContentLoaded', function(){
-    var tbl = document.getElementById('printer-table'); if(!tbl) return;
+
+  window.addEventListener("DOMContentLoaded", function(){
+    var tbl = document.getElementById("printer-table"); if(!tbl) return;
     var headers = tbl.tHead ? tbl.tHead.rows[0].cells : [];
-    var last = {col:-1, dir:'desc'};
+    var last = {col:-1, dir:"desc"};
     for (var i=0;i<headers.length;i++){
       (function(ix){
-        var isNumeric = (ix>=3 && ix<=17);  // numeric/sortable columns range
+        var isNumeric = (ix>=3 && ix<=18);
         if(!isNumeric) return;
-        headers[ix].style.cursor = 'pointer';
-        headers[ix].title = 'Click to sort';
-        headers[ix].addEventListener('click', function(){
-          var isPct = (ix>=3 && ix<=14);     // percent-style columns up to Maintenance
-          var dir = (last.col===ix && last.dir==='asc') ? 'desc' : 'asc';
-          sortTable('printer-table', ix, dir, isPct);
+        headers[ix].style.cursor = "pointer";
+        headers[ix].title = headers[ix].getAttribute("title") || "Click to sort";
+        headers[ix].addEventListener("click", function(){
+          var isPct = (ix>=3 && ix<=15);
+          var dir = (last.col===ix && last.dir==="asc") ? "desc" : "asc";
+          sortTableGrouped("printer-table", ix, dir, isPct);
           last = {col:ix, dir:dir};
         });
       })(i);
     }
   });
+
+  window.setView = function(v){
+    var tableWrap = document.getElementById("table-wrap");
+    var cards = document.getElementById("cards-view");
+    var btnTable = document.getElementById("btn-view-table");
+    var btnCards = document.getElementById("btn-view-cards");
+    var sortControls = document.getElementById("sort-controls");
+
+    if (v === "cards") {
+      tableWrap.classList.add("hidden");
+      cards.classList.remove("hidden");
+      btnCards.classList.add("active");
+      btnTable.classList.remove("active");
+      if (sortControls) sortControls.style.display = "none";
+    } else {
+      cards.classList.add("hidden");
+      tableWrap.classList.remove("hidden");
+      btnTable.classList.add("active");
+      btnCards.classList.remove("active");
+      if (sortControls) sortControls.style.display = "";
+    }
+  };
+
+  window.addEventListener("DOMContentLoaded", function(){
+    var btnCards = document.getElementById("btn-view-cards");
+    var sortControls = document.getElementById("sort-controls");
+    var cardsVisible = !document.getElementById("cards-view").classList.contains("hidden");
+    if (cardsVisible && sortControls) {
+      sortControls.style.display = "none";
+      btnCards && btnCards.classList.add("active");
+    }
+  });
 })();
 </script>
+
 </head>
 <body>
 "@ | Out-File -Encoding UTF8 -FilePath $ReportTmp
 
-# Heading + toolbar
+# Heading + toolbar with view toggle
 $validCount = ($printerlist.Value | Where-Object {$_ -and ($_ -notlike "-*")}).Count
 "Reporting on $validCount printers" | Add-Content $ReportTmp
 
 @"
 <div class="toolbar">
-  <label for="sort-col">Sort by:</label>
-  <select id="sort-col" aria-label="Sort column">
-    <option value="" selected disabled>Choose column…</option>
-    <option value="black">Black (%)</option>
-    <option value="blackw">Black (%/week)</option>
-    <option value="cyan">Cyan (%)</option>
-    <option value="cyanw">Cyan (%/week)</option>
-    <option value="magenta">Magenta (%)</option>
-    <option value="magentaw">Magenta (%/week)</option>
-    <option value="yellow">Yellow (%)</option>
-    <option value="yelloww">Yellow (%/week)</option>
-    <option value="waste">Waste (% full)</option>
-    <option value="drum">Drum (%)</option>
-    <option value="fuser">Fuser (%)</option>
-    <option value="maintenance">Maintenance (%)</option>
-    <option value="pages">Pages (count)</option>
-    <option value="pages1">Pages (1d)</option>
-    <option value="pages7">Pages (7d)</option>
-  </select>
+  <div class="view-switch">
+    <span>View:</span>
+    <button id="btn-view-table" class="btn active" type="button" onclick="setView('table')">Table</button>
+    <button id="btn-view-cards" class="btn" type="button" onclick="setView('cards')">Cards</button>
+  </div>
 
-  <label for="sort-dir">Direction:</label>
-  <select id="sort-dir" aria-label="Sort direction">
-    <option value="asc" selected>Low → High</option>
-    <option value="desc">High → Low</option>
-  </select>
+  <!-- Sort controls -->
+  <div id="sort-controls">
+    <label for="sort-col">Sort by:</label>
+    <select id="sort-col" aria-label="Sort column">
+      <option value="" selected disabled>Choose column...</option>
+      <option value="imaging">Imaging Kit (%)</option>
+      <option value="black">Black (%)</option>
+      <option value="blackw">Black (%/week)</option>
+      <option value="cyan">Cyan (%)</option>
+      <option value="cyanw">Cyan (%/week)</option>
+      <option value="magenta">Magenta (%)</option>
+      <option value="magentaw">Magenta (%/week)</option>
+      <option value="yellow">Yellow (%)</option>
+      <option value="yelloww">Yellow (%/week)</option>
+      <option value="waste">Waste (% full)</option>
+      <option value="drum">Drum (%)</option>
+      <option value="fuser">Fuser (%)</option>
+      <option value="maintenance">Maintenance (%)</option>
+      <option value="pages">Pages (count)</option>
+      <option value="pages1">Pages (1d)</option>
+      <option value="pages7">Pages (7d)</option>
+    </select>
 
-  <button type="button" onclick="_printerReportSort()">Sort</button>
+    <label for="sort-dir">Direction:</label>
+    <select id="sort-dir" aria-label="Sort direction">
+      <option value="asc" selected>Low -> High</option>
+      <option value="desc">High -> Low</option>
+    </select>
+
+    <button type="button" onclick="_printerReportSort()">Sort</button>
+  </div>
 </div>
 "@ | Add-Content $ReportTmp
 
-# Table start (now includes %/week right after each color)
+# Table wrapper
+"<div id='table-wrap'>" | Add-Content $ReportTmp
 "<table id='printer-table' style='width:100%'>" | Add-Content $ReportTmp
-"<thead><tr><th>Description</th><th>Name</th><th>Type</th><th>Black</th><th>Black (%/week)</th><th>Cyan</th><th>Cyan (%/week)</th><th>Magenta</th><th>Magenta (%/week)</th><th>Yellow</th><th>Yellow (%/week)</th><th>Waste</th><th>Drum</th><th>Fuser</th><th>Maintenance</th><th>Pages</th><th>Pages (1d)</th><th>Pages (7d)</th><th>Status</th></tr></thead>" | Add-Content $ReportTmp
-"<tbody>" | Add-Content $ReportTmp
+
+@"
+<thead>
+  <tr>
+    <th title="Device description from your list (e.g., location/notes)">Description</th>
+    <th title="Clickable name; opens printer web UI in a new tab">Name</th>
+    <th title="Model/type as reported by SNMP (hrDeviceDescr)">Type</th>
+    <th title="Imaging kit / imaging unit life (% remaining)">Imaging Kit</th>
+    <th title="Black toner (% remaining)">Black</th>
+    <th title="Estimated black usage this week (%/week)">Black (%/week)</th>
+    <th title="Cyan toner (% remaining)">Cyan</th>
+    <th title="Estimated cyan usage this week (%/week)">Cyan (%/week)</th>
+    <th title="Magenta toner (% remaining)">Magenta</th>
+    <th title="Estimated magenta usage this week (%/week)">Magenta (%/week)</th>
+    <th title="Yellow toner (% remaining)">Yellow</th>
+    <th title="Estimated yellow usage this week (%/week)">Yellow (%/week)</th>
+    <th title="Waste container (% full) - higher is worse">Waste</th>
+    <th title="Drum/photoconductor life (% remaining)">Drum</th>
+    <th title="Fuser life (% remaining)">Fuser</th>
+    <th title="Maintenance items (transfer/cleaner/etc.) (% remaining)">Maintenance</th>
+    <th title="Total lifetime pages (best available counter)">Pages</th>
+    <th title="Pages printed in last 1 day (based on history)">Pages (1d)</th>
+    <th title="Pages printed in last 7 days (based on history)">Pages (7d)</th>
+    <th title="Alerts/status from prtAlertDescription">Status</th>
+  </tr>
+</thead>
+<tbody>
+"@ | Add-Content $ReportTmp
 
 # SNMP COM
 try {
@@ -427,7 +796,6 @@ if ($WriteDebugCsv) {
 }
 
 $index = 0
-# $now was set earlier (also used for retention)
 $weekAgo = $now.AddDays(-7)
 $dayAgo  = $now.AddDays(-1)
 
@@ -435,7 +803,18 @@ foreach ($p in $printerlist) {
 
     # Section headers for lines starting with '-'
     if ($p.Value -like "-*") {
-        "<tr><td colspan='19'><h3>$(HtmlEncode($p.Value.TrimStart('-')))</h3></td></tr>" | Add-Content $ReportTmp
+        $sectionTitle = HtmlEncode($p.Value.TrimStart('-'))
+        "<tr><td colspan='20'><h3>$sectionTitle</h3></td></tr>" | Add-Content $ReportTmp
+
+        # CARDS: close previous grid if open, add section divider, and open a new grid
+        if ($cardsGridOpen) {
+            [void]$CardBuffer.AppendLine("</div>")
+            $cardsGridOpen = $false
+        }
+        [void]$CardBuffer.AppendLine("<h3 class='section-divider'>$sectionTitle</h3>")
+        [void]$CardBuffer.AppendLine("<div class='cards-grid'>")
+        $cardsGridOpen = $true
+
         continue
     }
 
@@ -445,13 +824,94 @@ foreach ($p in $printerlist) {
     $desc = $p.Description
 
     "<tr>" | Add-Content $ReportTmp
-    "<td><b>$(HtmlEncode($desc))</b></td>" | Add-Content $ReportTmp
+    "<td title='Description'><b>$(HtmlEncode($desc))</b></td>" | Add-Content $ReportTmp
 
     if (-not (Test-HostUp $ip)) {
+        # ============================
+        # OFFLINE: fallback to history
+        # ============================
         $href = "<a href=""http://$ip"" target=""_new"">$ip</a>"
-        # After Description: Name, Type(Offline), then 16 empties to fill to 19 columns
-        "<td>$href</td><td><b>Offline</b></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>" | Add-Content $ReportTmp
+        $cache = Get-HistorySnapshot -IP $ip
+        $cachedStamp = $null
+        if ($cache -and $cache.TS) {
+            $cachedStamp = $cache.TS.ToString("g")
+        }
+
+        "<td title='Device web interface'>$href</td>" | Add-Content $ReportTmp
+        if ($cachedStamp) {
+            "<td title='Model/Type'><b>Offline</b><br/><span style='color:#666;font-size:12px;'>Cached: $cachedStamp</span></td>" | Add-Content $ReportTmp
+        } else {
+            "<td title='Model/Type'><b>Offline</b></td>" | Add-Content $ReportTmp
+        }
+
+        "<td title='Imaging Kit'></td>" | Add-Content $ReportTmp
+        "<td title='Black Toner'>$(Format-PercentCell $cache.K)</td>"                 | Add-Content $ReportTmp
+        "<td title='Black Toner (%/week)'>$(Format-PercentPerWeek $cache.KWeek)</td>" | Add-Content $ReportTmp
+        "<td title='Cyan Toner'>$(Format-PercentCell $cache.C)</td>"                  | Add-Content $ReportTmp
+        "<td title='Cyan Toner (%/week)'>$(Format-PercentPerWeek $cache.CWeek)</td>"  | Add-Content $ReportTmp
+        "<td title='Magenta Toner'>$(Format-PercentCell $cache.M)</td>"               | Add-Content $ReportTmp
+        "<td title='Magenta Toner (%/week)'>$(Format-PercentPerWeek $cache.MWeek)</td>" | Add-Content $ReportTmp
+        "<td title='Yellow Toner'>$(Format-PercentCell $cache.Y)</td>"                | Add-Content $ReportTmp
+        "<td title='Yellow Toner (%/week)'>$(Format-PercentPerWeek $cache.YWeek)</td>" | Add-Content $ReportTmp
+
+        "<td title='Waste (% full)'></td><td title='Drum'></td><td title='Fuser'></td><td title='Maintenance'></td>" | Add-Content $ReportTmp
+
+        "<td title='Pages (lifetime)'>$(Format-Count $cache.Pages)</td>" | Add-Content $ReportTmp
+        "<td title='Pages (1d)'>$(Format-Count $cache.Pages1)</td>"      | Add-Content $ReportTmp
+        "<td title='Pages (7d)'>$(Format-Count $cache.Pages7)</td>"      | Add-Content $ReportTmp
+
+        if ($cachedStamp) {
+            "<td title='Status / Alerts'><b>Offline</b><br/><span style='color:#666;font-size:12px;'>Showing cached values from $cachedStamp</span></td>" | Add-Content $ReportTmp
+        } else {
+            "<td title='Status / Alerts'><b>Offline</b></td>" | Add-Content $ReportTmp
+        }
         "</tr>" | Add-Content $ReportTmp
+
+        # CARD: ensure a grid exists
+        if (-not $cardsGridOpen) {
+            [void]$CardBuffer.AppendLine("<div class='cards-grid'>")
+            $cardsGridOpen = $true
+        }
+
+        $nameOrIp = ($name,$ip | Where-Object {$_})[0]
+        $cachedNoteInline = ""
+        if ($cachedStamp) {
+            $cachedNoteInline = " <span style='color:#666;font-size:12px;'>(cached $cachedStamp)</span>"
+        }
+
+        $cardOffline = @"
+  <div class='card' data-ip='$ip' title='Printer offline'>
+    <div class='card-head'>
+      <div class='card-name'><a href="http://$ip" target="_new">$(HtmlEncode($nameOrIp))</a></div>
+      <div class='card-desc'>$(HtmlEncode($desc))</div>
+      <div class='card-type'><b>Offline</b>$cachedNoteInline</div>
+    </div>
+    <div class='card-body'>
+      <div class='metrics'>
+        <div class='metric'    title='Imaging Kit'>Imaging: &nbsp;</div>
+        <div class='metric k'  title='Black Toner'>Black: $(Format-PercentCell $cache.K)</div>
+        <div class='metric kw' title='Black Toner (%/week)'>/wk: $(Format-PercentPerWeek $cache.KWeek)</div>
+        <div class='metric c'  title='Cyan Toner'>Cyan: $(Format-PercentCell $cache.C)</div>
+        <div class='metric cw' title='Cyan Toner (%/week)'>/wk: $(Format-PercentPerWeek $cache.CWeek)</div>
+        <div class='metric m'  title='Magenta Toner'>Magenta: $(Format-PercentCell $cache.M)</div>
+        <div class='metric mw' title='Magenta Toner (%/week)'>/wk: $(Format-PercentPerWeek $cache.MWeek)</div>
+        <div class='metric y'  title='Yellow Toner'>Yellow: $(Format-PercentCell $cache.Y)</div>
+        <div class='metric yw' title='Yellow Toner (%/week)'>/wk: $(Format-PercentPerWeek $cache.YWeek)</div>
+        <div class='metric waste' title='Waste (% full)'>Waste: &nbsp;</div>
+        <div class='metric drum'  title='Drum'>Drum: &nbsp;</div>
+        <div class='metric fuser' title='Fuser'>Fuser: &nbsp;</div>
+        <div class='metric maint' title='Maintenance'>Maint: &nbsp;</div>
+      </div>
+      <div class='row pages'>
+        <span class='pill' title='Pages (lifetime)'>Pages: $(Format-Count $cache.Pages)</span>
+        <span class='pill' title='Pages (1d)'>1d: $(Format-Count $cache.Pages1)</span>
+        <span class='pill' title='Pages (7d)'>7d: $(Format-Count $cache.Pages7)</span>
+      </div>
+      <div class='row status' title='Status / Alerts'><b>Offline</b></div>
+    </div>
+  </div>
+"@
+        [void]$CardBuffer.AppendLine($cardOffline)
         continue
     }
 
@@ -462,8 +922,8 @@ foreach ($p in $printerlist) {
     [Nullable[Int64]]$Pages = $null
     [Nullable[Int64]]$Pages7 = $null
     [Nullable[Int64]]$Pages1 = $null
+    [Nullable[int]]$ImagingKit = $null
 
-    # Weekly usage per color (%/week)
     [Nullable[int]]$KWeek=$null; [Nullable[int]]$CWeek=$null; [Nullable[int]]$MWeek=$null; [Nullable[int]]$YWeek=$null
 
     try {
@@ -473,10 +933,14 @@ foreach ($p in $printerlist) {
         try { $printerType = $snmp.Get(".1.3.6.1.2.1.25.3.2.1.3.1") } catch {}
         $sysName = $null; try { $sysName = $snmp.Get(".1.3.6.1.2.1.1.5.0") } catch {}
 
-        # Supplies (index-aware + colorant-aware)
+        # Supplies
         $rows = Get-PrinterSupplies -Snmp $snmp
 
-        # Toners (Class=3, Type=3) → K/C/M/Y
+        # Imaging Kit (% remaining)
+        $imagingRow = $rows | Where-Object { $_.Desc -match '(?i)\bimaging\b' } | Select-Object -First 1
+        if ($imagingRow) { $ImagingKit = $imagingRow.Percent }
+
+        # Toners (Class=3, Type=3) -> K/C/M/Y
         $toners = $rows | Where-Object { $_.Class -eq 3 -and $_.Type -eq 3 }
         foreach ($t in $toners) {
             switch ($t.ColorLetter) {
@@ -486,38 +950,41 @@ foreach ($p in $printerlist) {
                 'Y' { if ($null -eq $Y) { $Y = $t.Percent } }
             }
         }
+        if ($null -eq $K) {
+            $singleToner = $toners | Where-Object { $_.Percent -ne $null } | Select-Object -First 2
+            if ($singleToner.Count -eq 1) { $K = $singleToner[0].Percent }
+        }
+        if ($null -eq $K) {
+            $colorlessK = $toners | Where-Object { $_.Percent -ne $null -and (Is-ColorlessTonerDesc -desc $_.Desc) } | Select-Object -First 1
+            if ($colorlessK) { $K = $colorlessK.Percent }
+        }
+        if ($null -eq $K -and $C -eq $null -and $M -eq $null -and $Y -eq $null) {
+            $best = $toners | Where-Object { $_.Percent -ne $null } | Sort-Object Percent -Descending | Select-Object -First 1
+            if ($best) { $K = $best.Percent }
+        }
 
-        # Waste (explicit waste types; otherwise any Class=4 'waste' row)
-        $wasteTypes = @(4,8,14) # wasteToner(4), wasteInk(8), wasteWax(14)
-        $wasteRow = $rows | Where-Object {
-            ($_.Type -in $wasteTypes) -or
-            ($_.Class -eq 4 -and $_.Desc -match '(?i)waste')
-        } | Select-Object -First 1
-        if ($wasteRow) { $Waste = $wasteRow.Percent }  # already % FULL
+        # Waste
+        $wasteTypes = @(4,8,14)
+        $wasteRow = $rows | Where-Object { ($_.Type -in $wasteTypes) -or ($_.Class -eq 4 -and $_.Desc -match '(?i)waste') } | Select-Object -First 1
+        if ($wasteRow) { $Waste = $wasteRow.Percent }
 
-        # Drum (OPC / photoconductor)
-        $drumRow = $rows | Where-Object {
-            ($_.Type -eq 9) -or ($_.Desc -match '(?i)(drum|opc|photoconductor)')
-        } | Select-Object -First 1
-        if ($drumRow) { $Drum = $drumRow.Percent }      # % remaining
+        # Drum
+        $drumRow = $rows | Where-Object { ($_.Type -eq 9) -or ($_.Desc -match '(?i)(drum|opc|photoconductor)') } | Select-Object -First 1
+        if ($drumRow) { $Drum = $drumRow.Percent }
 
         # Fuser
-        $fuserRow = $rows | Where-Object {
-            ($_.Type -eq 15) -or ($_.Desc -match '(?i)fuser')
-        } | Select-Object -First 1
-        if ($fuserRow) { $Fuser = $fuserRow.Percent }   # % remaining
+        $fuserRow = $rows | Where-Object { ($_.Type -eq 15) -or ($_.Desc -match '(?i)fuser') } | Select-Object -First 1
+        if ($fuserRow) { $Fuser = $fuserRow.Percent }
 
-        # Maintenance kit (transfer/cleaner/fuser-related or explicit "maintenance/kit")
+        # Maintenance kit
         $maintTypes = @(18,19,20,22)
-        $maintRow = $rows | Where-Object {
-            ($_.Type -in $maintTypes) -or ($_.Desc -match '(?i)\bmaintenance\b|\bkit\b')
-        } | Select-Object -First 1
+        $maintRow = $rows | Where-Object { ($_.Type -in $maintTypes) -or ($_.Desc -match '(?i)\bmaintenance\b|\bkit\b') } | Select-Object -First 1
         if ($maintRow) { $Maintenance = $maintRow.Percent }
 
-        # Lifetime pages (MAX prtMarkerLifeCount across rows)
+        # Lifetime pages
         $Pages = Get-PrinterPageCount -Snmp $snmp
 
-        # Compute 7-day and 1-day page deltas
+        # Compute 7-day and 1-day page deltas + %/week per color
         if ($Pages -ne $null) {
             $histRows = $history | Where-Object { $_.IP -eq $ip } |
                         Select-Object @{n='TS';e={[datetime]::Parse($_.Timestamp)}},
@@ -528,32 +995,19 @@ foreach ($p in $printerlist) {
                                       @{n='Y';e={ if($_.Y -match '^\d+$'){ [int]$_.Y } else { $null } }} |
                         Sort-Object TS
 
-            # 7 days baseline (for Pages7 and %/week fallback)
             $baseline7 = $histRows | Where-Object { $_.TS -le $weekAgo } | Sort-Object TS -Descending | Select-Object -First 1
+            if ($baseline7 -and $Pages -ge $baseline7.Pages) { $Pages7 = $Pages - $baseline7.Pages } else { $Pages7 = $null }
 
-            if ($baseline7 -and $Pages -ge $baseline7.Pages) {
-                $Pages7 = $Pages - $baseline7.Pages
-            } else {
-                $Pages7 = $null
-            }
-
-            # 1 day baseline (Pages1)
             $baseline1 = $histRows | Where-Object { $_.TS -le $dayAgo } | Sort-Object TS -Descending | Select-Object -First 1
-            if ($baseline1 -and $Pages -ge $baseline1.Pages) {
-                $Pages1 = $Pages - $baseline1.Pages
-            } else {
-                $Pages1 = $null
-            }
+            if ($baseline1 -and $Pages -ge $baseline1.Pages) { $Pages1 = $Pages - $baseline1.Pages } else { $Pages1 = $null }
 
-            # ---- Compute %/week per color, using pages ----
             function Get-WeeklyUsage {
                 param(
                     [Nullable[int]]$CurrentPct,
-                    [string]$ColorKey  # 'K','C','M','Y'
+                    [string]$ColorKey
                 )
                 if ($null -eq $CurrentPct) { return $null }
                 if ($null -eq $Pages7 -or $Pages7 -le 0) {
-                    # Fallback to empirical drop over week if baseline exists
                     if ($baseline7 -and ($baseline7.$ColorKey -ne $null)) {
                         $drop = $baseline7.$ColorKey - $CurrentPct
                         if ($drop -lt 0) { $drop = 0 }
@@ -561,11 +1015,9 @@ foreach ($p in $printerlist) {
                     }
                     return $null
                 }
-
-                # Use the same weekly baseline if available for ΔPages/Δ%
                 if ($baseline7 -and ($baseline7.Pages -ne $null) -and ($baseline7.$ColorKey -ne $null) -and $Pages -ge $baseline7.Pages) {
                     $deltaPages = $Pages - $baseline7.Pages
-                    $deltaPct   = $baseline7.$ColorKey - $CurrentPct  # positive means used
+                    $deltaPct   = $baseline7.$ColorKey - $CurrentPct
                     if ($deltaPct -lt 0) { $deltaPct = 0 }
                     if ($deltaPages -gt 0) {
                         $pctPerPage = $deltaPct / $deltaPages
@@ -573,14 +1025,11 @@ foreach ($p in $printerlist) {
                         return [int][math]::Min(100, [math]::Round($weekly))
                     }
                 }
-
-                # If we can't compute % per page, try empirical drop (if available)
                 if ($baseline7 -and ($baseline7.$ColorKey -ne $null)) {
                     $drop = $baseline7.$ColorKey - $CurrentPct
                     if ($drop -lt 0) { $drop = 0 }
                     return [int][math]::Min(100, [math]::Round($drop))
                 }
-
                 return $null
             }
 
@@ -590,14 +1039,6 @@ foreach ($p in $printerlist) {
             $YWeek = Get-WeeklyUsage -CurrentPct $Y -ColorKey 'Y'
         }
 
-        # Write debug rows if requested
-        if ($WriteDebugCsv) {
-            $rows | ForEach-Object {
-                "$ip,$($_.Hr),$($_.Index),""$($_.Desc.Replace('"',''''))"",$($_.Unit),$($_.Max),$($_.Level),$($_.Class),$($_.Type),$($_.ColorantIndex),""$($_.ColorLabel.Replace('"',''''))"",$($_.ColorLetter),$($_.Percent)" |
-                    Add-Content -Path $DebugCsv -Encoding UTF8
-            }
-        }
-
         # Alerts -> Status
         try {
             $alerts = @($snmp.GetTree(".1.3.6.1.2.1.43.18.1.1.8"))
@@ -605,35 +1046,71 @@ foreach ($p in $printerlist) {
             if ($filtered.Count -gt 0) { $statusText = ($filtered -join "; ") }
         } catch {}
 
-        # Name/Type cells
+        # TABLE cells: Name/Type
         $displayName = if ($sysName) { $sysName } else { $name }
         $href = "<a href=""http://$ip"" target=""_new"">$(HtmlEncode($displayName))</a>"
-        "<td>$href</td>" | Add-Content $ReportTmp
-        "<td><br/>$(HtmlEncode($printerType))<br/></td>" | Add-Content $ReportTmp
+        "<td title='Device web interface'>$href</td>" | Add-Content $ReportTmp
+        "<td title='Model/Type'><br/>$(HtmlEncode($printerType))<br/></td>" | Add-Content $ReportTmp
 
-        # Toner cells + %/week
-        "<td>$(Format-PercentCell $K)</td>"      | Add-Content $ReportTmp
-        "<td>$(Format-PercentPerWeek $KWeek)</td>" | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $C)</td>"      | Add-Content $ReportTmp
-        "<td>$(Format-PercentPerWeek $CWeek)</td>" | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $M)</td>"      | Add-Content $ReportTmp
-        "<td>$(Format-PercentPerWeek $MWeek)</td>" | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $Y)</td>"      | Add-Content $ReportTmp
-        "<td>$(Format-PercentPerWeek $YWeek)</td>" | Add-Content $ReportTmp
+        # TABLE cells: Imaging + Toners + Supplies + Pages + Status
+        "<td title='Imaging Kit'>$(Format-PercentCell $ImagingKit)</td>" | Add-Content $ReportTmp
+        "<td title='Black Toner'>$(Format-PercentCell $K)</td>" | Add-Content $ReportTmp
+        "<td title='Black Toner (%/week)'>$(Format-PercentPerWeek $KWeek)</td>" | Add-Content $ReportTmp
+        "<td title='Cyan Toner'>$(Format-PercentCell $C)</td>" | Add-Content $ReportTmp
+        "<td title='Cyan Toner (%/week)'>$(Format-PercentPerWeek $CWeek)</td>" | Add-Content $ReportTmp
+        "<td title='Magenta Toner'>$(Format-PercentCell $M)</td>" | Add-Content $ReportTmp
+        "<td title='Magenta Toner (%/week)'>$(Format-PercentPerWeek $MWeek)</td>" | Add-Content $ReportTmp
+        "<td title='Yellow Toner'>$(Format-PercentCell $Y)</td>" | Add-Content $ReportTmp
+        "<td title='Yellow Toner (%/week)'>$(Format-PercentPerWeek $YWeek)</td>" | Add-Content $ReportTmp
+        "<td title='Waste (% full)'>$(Format-PercentCellWaste $Waste)</td>" | Add-Content $ReportTmp
+        "<td title='Drum'>$(Format-PercentCell $Drum)</td>" | Add-Content $ReportTmp
+        "<td title='Fuser'>$(Format-PercentCell $Fuser)</td>" | Add-Content $ReportTmp
+        "<td title='Maintenance'>$(Format-PercentCell $Maintenance)</td>" | Add-Content $ReportTmp
+        "<td title='Pages (lifetime)'>$(Format-Count $Pages)</td>" | Add-Content $ReportTmp
+        "<td title='Pages (1d)'>$(Format-Count $Pages1)</td>" | Add-Content $ReportTmp
+        "<td title='Pages (7d)'>$(Format-Count $Pages7)</td>" | Add-Content $ReportTmp
+        "<td title='Status / Alerts'><b>$(HtmlEncode($statusText))</b></td>" | Add-Content $ReportTmp
 
-        # Waste/Drum/Fuser/Maintenance, Pages, Pages(1d), Pages(7d)
-        "<td>$(Format-PercentCellWaste $Waste)</td>" | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $Drum)</td>"       | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $Fuser)</td>"      | Add-Content $ReportTmp
-        "<td>$(Format-PercentCell $Maintenance)</td>"| Add-Content $ReportTmp
-        "<td>$(Format-Count $Pages)</td>"            | Add-Content $ReportTmp
-        "<td>$(Format-Count $Pages1)</td>"           | Add-Content $ReportTmp
-        "<td>$(Format-Count $Pages7)</td>"           | Add-Content $ReportTmp
+        # CARD view
+        if (-not $cardsGridOpen) {
+            [void]$CardBuffer.AppendLine("<div class='cards-grid'>")
+            $cardsGridOpen = $true
+        }
+        $card = @"
+  <div class='card' data-ip='$ip' title='Printer'>
+    <div class='card-head'>
+      <div class='card-name'><a href="http://$ip" target="_new">$(HtmlEncode($displayName))</a></div>
+      <div class='card-desc'>$(HtmlEncode($desc))</div>
+      <div class='card-type'>$(HtmlEncode($printerType))</div>
+    </div>
+    <div class='card-body'>
+      <div class='metrics'>
+        <div class='metric'   title='Imaging Kit'>Imaging: $(Format-PercentCell $ImagingKit)</div>
+        <div class='metric k' title='Black Toner'>Black: $(Format-PercentCell $K)</div>
+        <div class='metric kw' title='Black Toner (%/week)'>/wk: $(Format-PercentPerWeek $KWeek)</div>
+        <div class='metric c' title='Cyan Toner'>Cyan: $(Format-PercentCell $C)</div>
+        <div class='metric cw' title='Cyan Toner (%/week)'>/wk: $(Format-PercentPerWeek $CWeek)</div>
+        <div class='metric m' title='Magenta Toner'>Magenta: $(Format-PercentCell $M)</div>
+        <div class='metric mw' title='Magenta Toner (%/week)'>/wk: $(Format-PercentPerWeek $MWeek)</div>
+        <div class='metric y' title='Yellow Toner'>Yellow: $(Format-PercentCell $Y)</div>
+        <div class='metric yw' title='Yellow Toner (%/week)'>/wk: $(Format-PercentPerWeek $YWeek)</div>
+        <div class='metric waste' title='Waste (% full)'>Waste: $(Format-PercentCellWaste $Waste)</div>
+        <div class='metric drum'  title='Drum'>Drum: $(Format-PercentCell $Drum)</div>
+        <div class='metric fuser' title='Fuser'>Fuser: $(Format-PercentCell $Fuser)</div>
+        <div class='metric maint' title='Maintenance'>Maint: $(Format-PercentCell $Maintenance)</div>
+      </div>
+      <div class='row pages'>
+        <span class='pill' title='Pages (lifetime)'>Pages: $(Format-Count $Pages)</span>
+        <span class='pill' title='Pages (1d)'>1d: $(Format-Count $Pages1)</span>
+        <span class='pill' title='Pages (7d)'>7d: $(Format-Count $Pages7)</span>
+      </div>
+      <div class='row status' title='Status / Alerts'><b>$(HtmlEncode($statusText))</b></div>
+    </div>
+  </div>
+"@
+        [void]$CardBuffer.AppendLine($card)
 
-        # Status
-        "<td><b>$(HtmlEncode($statusText))</b></td>" | Add-Content $ReportTmp
-
-        # Append to history (ISO 8601; include K,C,M,Y)
+        # Append to history
         if ($Pages -ne $null) {
             $kOut = if ($K -ne $null) { $K } else { "" }
             $cOut = if ($C -ne $null) { $C } else { "" }
@@ -643,9 +1120,88 @@ foreach ($p in $printerlist) {
         }
 
     } catch {
+        # ============================
+        # SNMP failure: use cached data
+        # ============================
         $href = "<a href=""http://$ip"" target=""_new"">$(HtmlEncode(($name,$ip | Where-Object {$_})[0]))</a>"
-        # After Description: Name, Type(No data), then 16 empties to fill to 19 columns
-        "<td>$href</td><td><b>No data</b></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>" | Add-Content $ReportTmp
+        $cache = Get-HistorySnapshot -IP $ip
+        $cachedStamp = $null
+        if ($cache -and $cache.TS) {
+            $cachedStamp = $cache.TS.ToString("g")
+        }
+
+        "<td title='Device web interface'>$href</td>" | Add-Content $ReportTmp
+        if ($cachedStamp) {
+            "<td title='Model/Type'><b>No live data</b><br/><span style='color:#666;font-size:12px;'>Cached: $cachedStamp</span></td>" | Add-Content $ReportTmp
+        } else {
+            "<td title='Model/Type'><b>No data</b></td>" | Add-Content $ReportTmp
+        }
+
+        "<td title='Imaging Kit'></td>" | Add-Content $ReportTmp
+        "<td title='Black Toner'>$(Format-PercentCell $cache.K)</td>"                  | Add-Content $ReportTmp
+        "<td title='Black Toner (%/week)'>$(Format-PercentPerWeek $cache.KWeek)</td>"  | Add-Content $ReportTmp
+        "<td title='Cyan Toner'>$(Format-PercentCell $cache.C)</td>"                   | Add-Content $ReportTmp
+        "<td title='Cyan Toner (%/week)'>$(Format-PercentPerWeek $cache.CWeek)</td>"   | Add-Content $ReportTmp
+        "<td title='Magenta Toner'>$(Format-PercentCell $cache.M)</td>"                | Add-Content $ReportTmp
+        "<td title='Magenta Toner (%/week)'>$(Format-PercentPerWeek $cache.MWeek)</td>"| Add-Content $ReportTmp
+        "<td title='Yellow Toner'>$(Format-PercentCell $cache.Y)</td>"                 | Add-Content $ReportTmp
+        "<td title='Yellow Toner (%/week)'>$(Format-PercentPerWeek $cache.YWeek)</td>" | Add-Content $ReportTmp
+
+        "<td title='Waste (% full)'></td><td title='Drum'></td><td title='Fuser'></td><td title='Maintenance'></td>" | Add-Content $ReportTmp
+
+        "<td title='Pages (lifetime)'>$(Format-Count $cache.Pages)</td>" | Add-Content $ReportTmp
+        "<td title='Pages (1d)'>$(Format-Count $cache.Pages1)</td>"      | Add-Content $ReportTmp
+        "<td title='Pages (7d)'>$(Format-Count $cache.Pages7)</td>"      | Add-Content $ReportTmp
+
+        if ($cachedStamp) {
+            "<td title='Status / Alerts'><b>No live data</b><br/><span style='color:#666;font-size:12px;'>Showing cached values from $cachedStamp</span></td>" | Add-Content $ReportTmp
+        } else {
+            "<td title='Status / Alerts'><b>No data</b></td>" | Add-Content $ReportTmp
+        }
+
+        # CARD: ensure a grid exists
+        if (-not $cardsGridOpen) {
+            [void]$CardBuffer.AppendLine("<div class='cards-grid'>")
+            $cardsGridOpen = $true
+        }
+
+        $nameOrIp = ($name,$ip | Where-Object {$_})[0]
+        $state = "No data"
+        if ($cachedStamp) { $state = "No live data (cached $cachedStamp)" }
+
+        $cardNoData = @"
+  <div class='card' data-ip='$ip' title='$state'>
+    <div class='card-head'>
+      <div class='card-name'><a href="http://$ip" target="_new">$(HtmlEncode($nameOrIp))</a></div>
+      <div class='card-desc'>$(HtmlEncode($desc))</div>
+      <div class='card-type'><b>$state</b></div>
+    </div>
+    <div class='card-body'>
+      <div class='metrics'>
+        <div class='metric'    title='Imaging Kit'>Imaging: &nbsp;</div>
+        <div class='metric k'  title='Black Toner'>Black: $(Format-PercentCell $cache.K)</div>
+        <div class='metric kw' title='Black Toner (%/week)'>/wk: $(Format-PercentPerWeek $cache.KWeek)</div>
+        <div class='metric c'  title='Cyan Toner'>Cyan: $(Format-PercentCell $cache.C)</div>
+        <div class='metric cw' title='Cyan Toner (%/week)'>/wk: $(Format-PercentPerWeek $cache.CWeek)</div>
+        <div class='metric m'  title='Magenta Toner'>Magenta: $(Format-PercentCell $cache.M)</div>
+        <div class='metric mw' title='Magenta Toner (%/week)'>/wk: $(Format-PercentPerWeek $cache.MWeek)</div>
+        <div class='metric y'  title='Yellow Toner'>Yellow: $(Format-PercentCell $cache.Y)</div>
+        <div class='metric yw' title='Yellow Toner (%/week)'>/wk: $(Format-PercentPerWeek $cache.YWeek)</div>
+        <div class='metric waste' title='Waste (% full)'>Waste: &nbsp;</div>
+        <div class='metric drum'  title='Drum'>Drum: &nbsp;</div>
+        <div class='metric fuser' title='Fuser'>Fuser: &nbsp;</div>
+        <div class='metric maint' title='Maintenance'>Maint: &nbsp;</div>
+      </div>
+      <div class='row pages'>
+        <span class='pill' title='Pages (lifetime)'>Pages: $(Format-Count $cache.Pages)</span>
+        <span class='pill' title='Pages (1d)'>1d: $(Format-Count $cache.Pages1)</span>
+        <span class='pill' title='Pages (7d)'>7d: $(Format-Count $cache.Pages7)</span>
+      </div>
+      <div class='row status' title='Status / Alerts'><b>$state</b></div>
+    </div>
+  </div>
+"@
+        [void]$CardBuffer.AppendLine($cardNoData)
     } finally {
         try { $snmp.Close() } catch {}
     }
@@ -654,6 +1210,20 @@ foreach ($p in $printerlist) {
 }
 
 "</tbody></table>" | Add-Content $ReportTmp
+"</div>" | Add-Content $ReportTmp  # close #table-wrap
+
+# Close any open cards grid and output Cards view
+if ($cardsGridOpen) {
+    [void]$CardBuffer.AppendLine("</div>")
+    $cardsGridOpen = $false
+}
+
+@"
+<div id="cards-view" class="hidden">
+  $($CardBuffer.ToString())
+</div>
+"@ | Add-Content $ReportTmp
+
 $stamp = Get-Date -Format "dd/MM HH:mm"
 "<h3>$stamp</h3></body></html>" | Add-Content $ReportTmp
 
