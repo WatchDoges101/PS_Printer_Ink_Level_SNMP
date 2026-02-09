@@ -545,13 +545,17 @@ $cardsGridOpen = $false
 </style>
 <script>
 (function(){
-  function numFromCell(cell, isPercent){
-    if (!cell) return Number.POSITIVE_INFINITY;
+  // Returns an object { missing: boolean, value: number }
+  // missing = true when the cell has no numeric content (or is null/blank/nbsp)
+  function parseCellForSort(cell){
+    if (!cell) return { missing: true, value: 0 };
     var t = (cell.textContent || cell.innerText || "").replace(/\u00A0/g, " ").trim();
+    if (!t) return { missing: true, value: 0 };
     var m = t.match(/-?\d+(?:[.,]\d+)?/);
-    if (!m) return Number.POSITIVE_INFINITY;
+    if (!m) return { missing: true, value: 0 };
     var n = parseFloat(m[0].replace(",", "."));
-    return isNaN(n) ? Number.POSITIVE_INFINITY : n;
+    if (isNaN(n)) return { missing: true, value: 0 };
+    return { missing: false, value: n };
   }
 
   function getExpectedColumns(tbl){
@@ -580,6 +584,7 @@ $cardsGridOpen = $false
     var body = tbl.tBodies[0];
     var allRows = Array.prototype.slice.call(body.rows);
 
+    // Partition into groups to keep section headers intact
     var groups = [];
     var current = { header: null, rows: [] };
     for (var i = 0; i < allRows.length; i++){
@@ -600,18 +605,33 @@ $cardsGridOpen = $false
       if (rows && rows.length > 1){
         var sortable = [];
         var nonsortable = [];
+
         for (var k = 0; k < rows.length; k++){
           if (rows[k].cells && rows[k].cells.length === expected) {
             sortable.push(rows[k]);
           } else {
+            // Non-standard row in the middle of a section; preserve their relative order at the end
             nonsortable.push(rows[k]);
           }
         }
-        sortable.sort(function(a,b){
-          var av = numFromCell(a.cells[colIndex], isPercent);
-          var bv = numFromCell(b.cells[colIndex], isPercent);
-          return asc ? (av - bv) : (bv - av);
+
+        sortable.sort(function(a, b){
+          var av = parseCellForSort(a.cells[colIndex]);
+          var bv = parseCellForSort(b.cells[colIndex]);
+
+          // Primary key: rows with a value come before rows without a value
+          if (av.missing !== bv.missing) {
+            return av.missing ? 1 : -1;  // push missing to bottom for both asc/desc
+          }
+
+          // Secondary key: numeric comparison according to direction
+          if (asc) {
+            return av.value - bv.value;
+          } else {
+            return bv.value - av.value;
+          }
         });
+
         groups[g].rows = sortable.concat(nonsortable);
       }
     }
@@ -628,6 +648,7 @@ $cardsGridOpen = $false
     body.appendChild(frag);
   }
 
+  // Column index map unchanged
   var colMap = {
     imaging:{idx:3,pct:true},
     black:{idx:4,pct:true},  blackw:{idx:5,pct:true},
