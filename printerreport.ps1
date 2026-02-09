@@ -133,13 +133,70 @@ function Map-ColorLetter {
     param([string]$label)
     if ([string]::IsNullOrWhiteSpace($label)) { return $null }
     $d = $label.ToLowerInvariant()
-    if ($d -match '\bblack\b'  -or $d -match '\bbk\b' -or $d -match '(^|[^a-z])k([^a-z]|$)') { return 'K' }
-    if ($d -match '\bcyan\b'   -or $d -match '(^|[^a-z])c([^a-z]|$)') { return 'C' }
-    if ($d -match '\bmagenta\b'-or $d -match '(^|[^a-z])m([^a-z]|$)') { return 'M' }
-    if ($d -match '\byellow\b' -or $d -match '(^|[^a-z])y([^a-z]|$)') { return 'Y' }
+
+    # Common full names
+    if ($d -match '\bblack\b'  -or $d -match '\bmono\b' -or $d -match '\bmonochrome\b') { return 'K' }
+    if ($d -match '\bcyan\b')    { return 'C' }
+    if ($d -match '\bmagenta\b') { return 'M' }
+    if ($d -match '\byellow\b')  { return 'Y' }
+
+    # Single-letter or bracketed letters
+    if ($d -match '(^|[^a-z])k([^a-z]|$)' -or $d -match '\bbk\b') { return 'K' }
+    if ($d -match '(^|[^a-z])c([^a-z]|$)') { return 'C' }
+    if ($d -match '(^|[^a-z])m([^a-z]|$)') { return 'M' }
+    if ($d -match '(^|[^a-z])y([^a-z]|$)') { return 'Y' }
+
+    # Lexmark/abbrev variants
+    if ($d -match '\bblk\b' -or $d -match '\bblack\s*kit\b' -or $d -match '\bbk\s*(unit|kit|pc)\b') { return 'K' }
+    if ($d -match '\bcyn\b' -or $d -match '\bcyan\s*kit\b')    { return 'C' }
+    if ($d -match '\bmag\b' -or $d -match '\bmagenta\s*kit\b') { return 'M' }
+    if ($d -match '\byel\b' -or $d -match '\byellow\s*kit\b')  { return 'Y' }
+
     return $null
 }
+function Is-ImagingLikeSupply {
+    param([string]$desc, [int]$type)
 
+    # Type=9 is Drum/Photoconductor in Printer-MIB
+    if ($type -eq 9) { return $true }
+
+    if ([string]::IsNullOrWhiteSpace($desc)) { return $false }
+
+    $d = $desc.ToLowerInvariant()
+
+    # Imaging unit/kit, photoconductor, OPC, PC unit/kit, developer unit, photo unit
+    return ($d -match '\b(imaging\s*(unit|kit)?)\b' -or
+            $d -match '\b(photoconductor|photo-?conductor|opc)\b' -or
+            $d -match '\b(pc\s*unit|pc\s*kit)\b' -or
+            $d -match '\b(developer\s*(unit|kit))\b' -or
+            $d -match '\b(photo\s*unit)\b')
+}
+
+function Get-ImagingByColor {
+    param([object[]]$rows)
+
+    $result = [ordered]@{ K=$null; C=$null; M=$null; Y=$null; Any=$null }
+
+    if (-not $rows) { return $result }
+
+    $candidates = $rows | Where-Object { Is-ImagingLikeSupply -desc $_.Desc -type $_.Type }
+
+    foreach ($r in $candidates) {
+        $letter = $r.ColorLetter
+        if (-not $letter) {
+            if ($r.ColorLabel) { $letter = Map-ColorLetter -label $r.ColorLabel }
+            if (-not $letter -and $r.Desc) { $letter = Map-ColorLetter -label $r.Desc }
+        }
+
+        if ($letter -and $r.Percent -ne $null) {
+            if ($result[$letter] -eq $null) { $result[$letter] = $r.Percent }
+        } elseif ($r.Percent -ne $null) {
+            if ($result.Any -eq $null) { $result.Any = $r.Percent }
+        }
+    }
+
+    return $result
+}
 # Query all supply rows *by index* and join with colorant names.
 function Get-PrinterSupplies {
     param(
@@ -205,7 +262,7 @@ function Is-ColorlessTonerDesc {
     param([string]$desc)
     if ([string]::IsNullOrWhiteSpace($desc)) { return $false }
     $d = $desc.ToLowerInvariant()
-    $looksLikeToner = ($d -match '\btoner\b' -or $d -match '\bcartridge\b' -or $d -match '\bctg\b')
+    $looksLikeToner = ($d -match '\btoner\b' -or $d -match '\bcartridge\b' -or $d -match '\bctg\b' -or $d -match '\bprint\s*cartridge\b')
     $mentionsAColor = ($d -match '\bblack\b' -or $d -match '\bbk\b' -or $d -match '(^|[^a-z])k([^a-z]|$)' -or
                        $d -match '\bcyan\b' -or $d -match '(^|[^a-z])c([^a-z]|$)' -or
                        $d -match '\bmagenta\b' -or $d -match '(^|[^a-z])m([^a-z]|$)' -or
@@ -957,20 +1014,37 @@ foreach ($p in $printerlist) {
         # Supplies
         $rows = Get-PrinterSupplies -Snmp $snmp
 
-        # Imaging Kit (% remaining)
-        $imagingRow = $rows | Where-Object { $_.Desc -match '(?i)\bimaging\b' } | Select-Object -First 1
-        if ($imagingRow) { $ImagingKit = $imagingRow.Percent }
+        # === Imaging Kits (per color when available, else fallback) ===
+$imaging = Get-ImagingByColor -rows $rows
 
-        # Toners (Class=3, Type=3) -> K/C/M/Y
-        $toners = $rows | Where-Object { $_.Class -eq 3 -and $_.Type -eq 3 }
-        foreach ($t in $toners) {
-            switch ($t.ColorLetter) {
-                'K' { if ($null -eq $K) { $K = $t.Percent } }
-                'C' { if ($null -eq $C) { $C = $t.Percent } }
-                'M' { if ($null -eq $M) { $M = $t.Percent } }
-                'Y' { if ($null -eq $Y) { $Y = $t.Percent } }
-            }
-        }
+# Show the "worst (lowest %)" imaging among available K/C/M/Y if any; else mono (Any)
+[Nullable[int]]$ImagingKit = $null
+$colorImagingValues = @()
+if ($imaging.K -ne $null) { $colorImagingValues += $imaging.K }
+if ($imaging.C -ne $null) { $colorImagingValues += $imaging.C }
+if ($imaging.M -ne $null) { $colorImagingValues += $imaging.M }
+if ($imaging.Y -ne $null) { $colorImagingValues += $imaging.Y }
+
+if ($colorImagingValues.Count -gt 0) {
+    $ImagingKit = ($colorImagingValues | Measure-Object -Minimum).Minimum
+} elseif ($imaging.Any -ne $null) {
+    $ImagingKit = $imaging.Any
+}
+
+        # Toners: (Class=3 AND (Type=3 OR description suggests toner/cartridge))
+$toners = $rows | Where-Object {
+    ($_.Class -eq 3 -and $_.Type -eq 3) -or
+    ($_.Class -eq 3 -and $_.Desc -match '(?i)\b(toner|cartridge|ctg|print\s*cartridge)\b')
+}
+
+foreach ($t in $toners) {
+    switch ($t.ColorLetter) {
+        'K' { if ($null -eq $K) { $K = $t.Percent } }
+        'C' { if ($null -eq $C) { $C = $t.Percent } }
+        'M' { if ($null -eq $M) { $M = $t.Percent } }
+        'Y' { if ($null -eq $Y) { $Y = $t.Percent } }
+    }
+}
         if ($null -eq $K) {
             $singleToner = $toners | Where-Object { $_.Percent -ne $null } | Select-Object -First 2
             if ($singleToner.Count -eq 1) { $K = $singleToner[0].Percent }
@@ -986,8 +1060,10 @@ foreach ($p in $printerlist) {
 
         # Waste
         $wasteTypes = @(4,8,14)
-        $wasteRow = $rows | Where-Object { ($_.Type -in $wasteTypes) -or ($_.Class -eq 4 -and $_.Desc -match '(?i)waste') } | Select-Object -First 1
-        if ($wasteRow) { $Waste = $wasteRow.Percent }
+        $wasteRow = $rows | Where-Object {
+    	($_.Type -in $wasteTypes) -or
+    	($_.Class -eq 4 -and $_.Desc -match '(?i)\b(waste|waste\s*(toner|box|bottle|container))\b')
+	} | Select-Object -First 1
 
         # Drum
         $drumRow = $rows | Where-Object { ($_.Type -eq 9) -or ($_.Desc -match '(?i)(drum|opc|photoconductor)') } | Select-Object -First 1
